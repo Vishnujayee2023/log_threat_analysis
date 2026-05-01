@@ -23,6 +23,14 @@ COLUMNS = [
 
 CATEGORICAL_COLS = ['protocol_type', 'service', 'flag']
 
+# Known aliases: values in uploaded CSVs that differ from NSL-KDD training labels
+SERVICE_ALIASES = {
+    'imap':     'imap4',
+    'ssl':      'private',
+    'http_80':  'http',
+    'https':    'http_443',
+}
+
 
 def load_dataset(train_path, test_path=None):
     """Load NSL-KDD dataset from CSV files."""
@@ -104,39 +112,86 @@ def split_data(X, y, test_size=0.2, random_state=42):
 def preprocess_uploaded_file(filepath):
     """
     Preprocess a user-uploaded CSV log file for prediction.
-    Handles both NSL-KDD format and partial uploads.
+    Handles NSL-KDD format variations:
+      - 43 cols: 41 features + label + difficulty  (sample_logs.csv style)
+      - 42 cols: 41 features + label + difficulty (no trailing col)
+      - 41 cols: 40 features + label  OR  41 features no label (auto-detected)
+      - <41 cols: best-effort assignment
     """
     df = pd.read_csv(filepath, header=None)
+    ncols = df.shape[1]
 
-    # Assign column names based on number of columns
-    if df.shape[1] >= 42:
-        df.columns = COLUMNS[:df.shape[1]]
+    if ncols >= 43:
+        # Full NSL-KDD: 41 features + label + difficulty
+        df.columns = COLUMNS[:ncols]
         if 'difficulty' in df.columns:
             df = df.drop(columns=['difficulty'])
-    elif df.shape[1] == 41:
-        df.columns = COLUMNS[:41]
+
+    elif ncols == 42:
+        df.columns = COLUMNS[:42]
+        if 'difficulty' in df.columns:
+            df = df.drop(columns=['difficulty'])
+
+    elif ncols == 41:
+        # Detect whether last column is label (strings) or a numeric feature
+        last_col = df.iloc[:, 40]
+        is_label = (
+            last_col.dtype == object or
+            last_col.astype(str).str.match(r'^[a-zA-Z]').any()
+        )
+        if is_label:
+            # 40 features + label (your test_500, test_1000 etc.)
+            df.columns = COLUMNS[:40] + ['label']
+        else:
+            # 41 pure features, no label
+            df.columns = COLUMNS[:41]
+
     else:
-        # Try to assign as many columns as possible
-        df.columns = COLUMNS[:df.shape[1]]
+        # Best-effort: assign as many columns as possible
+        df.columns = COLUMNS[:ncols]
 
     # Store original label if present
     original_labels = None
     if 'label' in df.columns:
         original_labels = df['label'].copy()
 
-    # Clean + encode
+    # Fill numeric NaNs
     for col in df.select_dtypes(include=[np.number]).columns:
         df[col] = df[col].fillna(df[col].mean())
 
-    # Load saved encoders
+    # Encode categorical columns
     if os.path.exists('encoders.pkl'):
         encoders = joblib.load('encoders.pkl')
         for col in CATEGORICAL_COLS:
             if col in df.columns:
                 le = encoders[col]
-                df[col] = df[col].astype(str).apply(
-                    lambda x: le.transform([x])[0] if x in le.classes_ else 0
-                )
+
+                def safe_encode(x, le=le):
+                    x = str(x).strip()
+                    # 1. Try direct alias map
+                    x = SERVICE_ALIASES.get(x, x)
+                    # 2. Exact match
+                    if x in le.classes_:
+                        return le.transform([x])[0]
+                    # 3. Fuzzy substring match
+                    matches = [c for c in le.classes_ if x in c or c in x]
+                    if matches:
+                        return le.transform([matches[0]])[0]
+                    # 4. Fall back to 'other' if it exists, else 0
+                    return le.transform(['other'])[0] if 'other' in le.classes_ else 0
+
+                df[col] = df[col].astype(str).apply(safe_encode)
+    else:
+        # No encoders.pkl — fresh encode (model accuracy will be lower)
+        for col in CATEGORICAL_COLS:
+            if col in df.columns:
+                le = LabelEncoder()
+                df[col] = le.fit_transform(df[col].astype(str))
+
+    # Safety net: force all feature columns to numeric — catches any remaining strings
+    for col in df.columns:
+        if col not in ['label', 'binary_label', 'attack_type']:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
     feature_cols = [c for c in df.columns if c not in ['label', 'binary_label', 'attack_type']]
     X = df[feature_cols]
