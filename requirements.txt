@@ -1,0 +1,12 @@
+pandas
+numpy
+scikit-learn
+joblib
+streamlit
+matplotlib
+seaborn
+plotly
+fpdf2
+drain3
+sentence-transformers
+chromadb
