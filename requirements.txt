@@ -12,3 +12,5 @@ sentence-transformers
 chromadb
 groq
 torchvision
+protobuf
+pysqlite3-binary
