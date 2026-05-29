@@ -11,3 +11,4 @@ drain3
 sentence-transformers
 chromadb
 groq
+torchvision
