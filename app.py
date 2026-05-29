@@ -15,9 +15,16 @@ import tempfile
 try:
     from rag_module import get_knowledge_base, get_explanations_for_top_threats
     RAG_AVAILABLE = True
+    print("RAG module imported successfully")
+
 except Exception as e:
     RAG_AVAILABLE = False
+    import traceback
+    traceback.print_exc()
 
+    st.error(f"RAG Import Error: {e}")
+    
+RAG_AVAILABLE = True
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="AI Threat Detection System",
