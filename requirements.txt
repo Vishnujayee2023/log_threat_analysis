@@ -10,3 +10,4 @@ fpdf2
 drain3
 sentence-transformers
 chromadb
+groq
