@@ -11,6 +11,13 @@ from sklearn.metrics import roc_curve, auc
 from fpdf import FPDF
 import tempfile
 
+# RAG Module import
+try:
+    from rag_module import get_knowledge_base, get_explanations_for_top_threats
+    RAG_AVAILABLE = True
+except Exception as e:
+    RAG_AVAILABLE = False
+
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="AI Threat Detection System",
@@ -46,20 +53,10 @@ COLUMNS = [
     'dst_host_srv_rerror_rate', 'label', 'difficulty'
 ]
 
-# Known aliases: values in uploaded CSVs that differ from NSL-KDD training labels
-SERVICE_ALIASES = {
-    'imap':    'imap4',
-    'ssl':     'private',
-    'http_80': 'http',
-    'https':   'http_443',
-}
-
-
 def assign_risk(prob):
-    if prob < 0.4:    return 'Low'
+    if prob < 0.4:   return 'Low'
     elif prob < 0.75: return 'Medium'
     else:             return 'High'
-
 
 def mask_ip(ip_str):
     """
@@ -74,7 +71,6 @@ def mask_ip(ip_str):
         return re.sub(pattern, r'\1.\2.x.x', ip_str)
     return ip_str  # return as-is if not an IP
 
-
 def apply_pii_masking(df):
     """
     Scans all string columns for IP-like values and masks them.
@@ -85,87 +81,48 @@ def apply_pii_masking(df):
         masked_df[col] = masked_df[col].apply(mask_ip)
     return masked_df
 
-
 def preprocess_uploaded(df_raw):
     df = df_raw.copy()
-    ncols = df.shape[1]
 
-    # ── Column assignment: handles all NSL-KDD CSV variants ──────────────────
-    if ncols >= 43:
-        # Full NSL-KDD: 41 features + label + difficulty (+ any extra trailing cols)
-        df.columns = COLUMNS[:ncols]
+    # Assign column names if no header
+    if df.shape[1] >= 42:
+        df.columns = COLUMNS[:df.shape[1]]
         if 'difficulty' in df.columns:
             df = df.drop(columns=['difficulty'])
+    elif df.shape[1] == 41:
+        df.columns = COLUMNS[:41]
 
-    elif ncols == 42:
-        df.columns = COLUMNS[:42]
-        if 'difficulty' in df.columns:
-            df = df.drop(columns=['difficulty'])
-
-    elif ncols == 41:
-        # Detect whether last column is label (strings) or a numeric feature
-        last_col = df.iloc[:, 40]
-        is_label = (
-            last_col.dtype == object or
-            last_col.astype(str).str.match(r'^[a-zA-Z]').any()
-        )
-        if is_label:
-            # 40 features + label (test_500, test_1000, etc.)
-            df.columns = COLUMNS[:40] + ['label']
-        else:
-            # 41 pure features, no label
-            df.columns = COLUMNS[:41]
-
-    else:
-        # Best-effort: assign as many columns as we have
-        df.columns = COLUMNS[:ncols]
-
-    # ── Store original label if present ──────────────────────────────────────
     original_labels = None
     if 'label' in df.columns:
         original_labels = df['label'].copy()
 
-    # ── Fill missing values ───────────────────────────────────────────────────
+    # Fill missing
     for col in df.select_dtypes(include=[np.number]).columns:
         df[col] = df[col].fillna(df[col].mean())
     for col in df.select_dtypes(include=['object']).columns:
         if col != 'label':
             df[col] = df[col].fillna(df[col].mode()[0])
 
-    # ── Encode categoricals with alias map + fuzzy substring fallback ─────────
+    # Encode categoricals
     for col in CATEGORICAL_COLS:
         if col in df.columns:
             le = encoders[col]
+            df[col] = df[col].astype(str).apply(
+                lambda x: le.transform([x])[0] if x in le.classes_ else 0
+            )
 
-            def safe_encode(x, le=le):
-                x = str(x).strip()
-                # 1. Try alias map first
-                x = SERVICE_ALIASES.get(x, x)
-                # 2. Exact match
-                if x in le.classes_:
-                    return le.transform([x])[0]
-                # 3. Fuzzy substring match
-                matches = [c for c in le.classes_ if x in c or c in x]
-                if matches:
-                    return le.transform([matches[0]])[0]
-                # 4. Fall back to 'other' if it exists, else 0
-                return le.transform(['other'])[0] if 'other' in le.classes_ else 0
-
-            df[col] = df[col].astype(str).apply(safe_encode)
-
-    # ── Safety net: force all feature columns to numeric ─────────────────────
-    for col in df.columns:
-        if col not in ['label', 'binary_label', 'attack_type']:
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-
-    # ── Align to trained feature columns (add any missing cols as 0) ─────────
+    fc = [c for c in df.columns if c not in ['label', 'binary_label', 'attack_type']]
+    # Align to trained feature columns
     for c in feature_cols:
-        if c not in df.columns:
+        if c not in fc:
             df[c] = 0
-
     X = df[feature_cols]
-    return X, original_labels
 
+    # CRITICAL FIX: Force all columns to numeric
+    # Converts any remaining text values to NaN then fills with 0
+    X = X.apply(pd.to_numeric, errors='coerce').fillna(0)
+
+    return X, original_labels
 
 def generate_pdf(result_df, metrics_dict):
     pdf = FPDF()
@@ -202,15 +159,14 @@ def generate_pdf(result_df, metrics_dict):
     pdf.ln()
     pdf.set_font("Helvetica", "", 9)
     for _, row in result_df.head(20).iterrows():
-        pdf.cell(50, 6, str(row.get('Prediction', '')),         border=1)
-        pdf.cell(40, 6, str(row.get('Risk Level', '')),         border=1)
+        pdf.cell(50, 6, str(row.get('Prediction', '')),        border=1)
+        pdf.cell(40, 6, str(row.get('Risk Level', '')),        border=1)
         pdf.cell(60, 6, str(row.get('Attack Probability', '')), border=1)
         pdf.ln()
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     pdf.output(tmp.name)
     return tmp.name
-
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 st.title("🛡️ AI-Driven Log File Threat Detection System")
@@ -232,15 +188,34 @@ with st.sidebar:
     ip_masking_on = st.toggle("Enable IP Masking", value=True)
     if ip_masking_on:
         st.success("IP Masking ON — GDPR / DPDP Act 2023 compliant")
+    st.divider()
+    st.markdown("**🧠 RAG / LLM Module**")
+    if RAG_AVAILABLE:
+        groq_api_key = st.text_input(
+            "Groq API Key",
+            type="password",
+            placeholder="gsk_xxxxxxxxxxxxxxxxxxxx",
+            help="Get free key at console.groq.com"
+        )
+        rag_enabled = st.toggle("Enable RAG Explanations", value=False)
+        if rag_enabled and groq_api_key:
+            st.success("RAG Module ON — LLM explanations enabled")
+        elif rag_enabled and not groq_api_key:
+            st.warning("Enter Groq API key to enable RAG")
+            rag_enabled = False
+    else:
+        st.warning("RAG module not available — install groq, chromadb, sentence-transformers")
+        groq_api_key = ""
+        rag_enabled = False
 
 # ── Pre-trained metrics always visible ───────────────────────────────────────
-st.subheader("📊 Model Performance")
+st.subheader("📊 Model Performance — Objective 3")
 c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("Accuracy",    f"{saved_metrics['accuracy']}%")
-c2.metric("Precision",   f"{saved_metrics['precision']}%")
-c3.metric("Recall",      f"{saved_metrics['recall']}%")
-c4.metric("F1-Score",    f"{saved_metrics['f1']}%")
-c5.metric("ROC-AUC",     f"{saved_metrics['roc_auc']}%")
+c1.metric("Accuracy",  f"{saved_metrics['accuracy']}%")
+c2.metric("Precision", f"{saved_metrics['precision']}%")
+c3.metric("Recall",    f"{saved_metrics['recall']}%")
+c4.metric("F1-Score",  f"{saved_metrics['f1']}%")
+c5.metric("ROC-AUC",   f"{saved_metrics['roc_auc']}%")
 c6.metric("CV (5-Fold)", f"{saved_metrics['cv_mean']}%")
 
 st.divider()
@@ -270,7 +245,7 @@ with col_cm:
         else:
             text.set_color('white')
     ax.set_xlabel('Predicted', color='white', fontsize=12)
-    ax.set_ylabel('Actual',    color='white', fontsize=12)
+    ax.set_ylabel('Actual', color='white', fontsize=12)
     ax.tick_params(colors='white', labelsize=11)
     ax.set_title(
         f"TN={cm[0][0]:,}  FP={cm[0][1]:,}  |  FN={cm[1][0]:,}  TP={cm[1][1]:,}",
@@ -284,25 +259,26 @@ with col_roc:
     if 'y_proba' in saved_metrics and 'confusion_matrix' in saved_metrics:
         cm = np.array(saved_metrics['confusion_matrix'])
         tn, fp, fn, tp = cm.ravel()
+        total = tn + fp + fn + tp
         # Synthetic smooth ROC for display (real AUC from saved metrics)
-        fpr_pts  = np.linspace(0, 1, 100)
-        auc_val  = saved_metrics['roc_auc'] / 100
-        tpr_pts  = np.power(fpr_pts, 1 / (auc_val * 3))
-        fig_roc  = go.Figure()
+        fpr_pts = np.linspace(0, 1, 100)
+        auc_val = saved_metrics['roc_auc'] / 100
+        tpr_pts = np.power(fpr_pts, 1 / (auc_val * 3))
+        fig_roc = go.Figure()
         fig_roc.add_trace(go.Scatter(
             x=fpr_pts, y=tpr_pts, mode='lines',
             name=f"ROC (AUC={saved_metrics['roc_auc']}%)",
             line=dict(color='#1f77b4', width=2)
         ))
         fig_roc.add_trace(go.Scatter(
-            x=[0, 1], y=[0, 1], mode='lines',
+            x=[0,1], y=[0,1], mode='lines',
             line=dict(dash='dash', color='gray'), name='Random'
         ))
         fig_roc.update_layout(
             xaxis_title='False Positive Rate',
             yaxis_title='True Positive Rate',
             paper_bgcolor='#0e1117', plot_bgcolor='#0e1117',
-            font_color='white', margin=dict(l=40, r=20, t=20, b=40),
+            font_color='white', margin=dict(l=40,r=20,t=20,b=40),
             height=300, legend=dict(x=0.4, y=0.1)
         )
         st.plotly_chart(fig_roc, use_container_width=True)
@@ -311,14 +287,14 @@ st.divider()
 
 # ── File upload prediction section ───────────────────────────────────────────
 if uploaded is not None:
-    st.subheader("🔍 Live Log Analysis")
+    st.subheader("🔍 Live Log Analysis — Objective 1 & 2")
 
     df_raw = pd.read_csv(uploaded, header=None)
     st.info(f"File loaded: **{uploaded.name}** — {df_raw.shape[0]:,} rows, {df_raw.shape[1]} columns")
 
     with st.spinner("Running ML classification..."):
         X, original_labels = preprocess_uploaded(df_raw)
-        predictions  = model.predict(X)
+        predictions = model.predict(X)
         probabilities = model.predict_proba(X)[:, 1]
 
     # Build result dataframe
@@ -326,7 +302,7 @@ if uploaded is not None:
         'Log #':              range(1, len(predictions) + 1),
         'Prediction':         ['Malicious' if p == 1 else 'Normal' for p in predictions],
         'Risk Level':         [assign_risk(p) for p in probabilities],
-        'Attack Probability': [f"{p * 100:.1f}%" for p in probabilities],
+        'Attack Probability': [f"{p*100:.1f}%" for p in probabilities],
     })
     if original_labels is not None:
         result_df['Original Label'] = original_labels.values
@@ -346,12 +322,12 @@ if uploaded is not None:
 
     st.subheader("Summary")
     s1, s2, s3, s4, s5, s6 = st.columns(6)
-    s1.metric("Total Logs",     f"{total:,}")
-    s2.metric("Normal",         f"{normal:,}")
-    s3.metric("Malicious",      f"{attacks:,}")
-    s4.metric("🔴 High Risk",   f"{high:,}")
-    s5.metric("🟡 Medium Risk", f"{medium:,}")
-    s6.metric("🟢 Low Risk",    f"{low:,}")
+    s1.metric("Total Logs",    f"{total:,}")
+    s2.metric("Normal",        f"{normal:,}")
+    s3.metric("Malicious",     f"{attacks:,}")
+    s4.metric("🔴 High Risk",  f"{high:,}")
+    s5.metric("🟡 Medium Risk",f"{medium:,}")
+    s6.metric("🟢 Low Risk",   f"{low:,}")
 
     st.divider()
 
@@ -368,7 +344,7 @@ if uploaded is not None:
         fig_pie.update_layout(
             paper_bgcolor='rgba(0,0,0,0)',
             font_color='white', height=300,
-            margin=dict(l=10, r=10, t=10, b=10)
+            margin=dict(l=10,r=10,t=10,b=10)
         )
         st.plotly_chart(fig_pie, use_container_width=True)
 
@@ -378,14 +354,14 @@ if uploaded is not None:
             x=['High', 'Medium', 'Low'],
             y=[high, medium, low],
             color=['High', 'Medium', 'Low'],
-            color_discrete_map={'High': '#e74c3c', 'Medium': '#f39c12', 'Low': '#2ecc71'}
+            color_discrete_map={'High':'#e74c3c','Medium':'#f39c12','Low':'#2ecc71'}
         )
         fig_bar.update_layout(
             paper_bgcolor='rgba(0,0,0,0)',
             plot_bgcolor='rgba(0,0,0,0)',
             font_color='white', height=300,
             showlegend=False,
-            margin=dict(l=10, r=10, t=10, b=10)
+            margin=dict(l=10,r=10,t=10,b=10)
         )
         st.plotly_chart(fig_bar, use_container_width=True)
 
@@ -397,13 +373,13 @@ if uploaded is not None:
             y=sample,
             labels={'x': 'Log Entry', 'y': 'Attack Probability'}
         )
-        fig_line.add_hline(y=0.75, line_dash="dash", line_color="red",    annotation_text="High threshold")
+        fig_line.add_hline(y=0.75, line_dash="dash", line_color="red",   annotation_text="High threshold")
         fig_line.add_hline(y=0.40, line_dash="dash", line_color="orange", annotation_text="Medium threshold")
         fig_line.update_layout(
             paper_bgcolor='rgba(0,0,0,0)',
             plot_bgcolor='rgba(0,0,0,0)',
             font_color='white', height=300,
-            margin=dict(l=10, r=10, t=10, b=10)
+            margin=dict(l=10,r=10,t=10,b=10)
         )
         st.plotly_chart(fig_line, use_container_width=True)
 
@@ -425,7 +401,7 @@ if uploaded is not None:
 
     def color_rows(row):
         if row['Prediction'] == 'Malicious':
-            if row['Risk Level'] == 'High':    return ['background-color: #3d0000'] * len(row)
+            if row['Risk Level'] == 'High':   return ['background-color: #3d0000'] * len(row)
             elif row['Risk Level'] == 'Medium': return ['background-color: #2d1a00'] * len(row)
         return [''] * len(row)
 
@@ -464,6 +440,74 @@ if uploaded is not None:
                         mime="application/pdf",
                         use_container_width=True
                     )
+
+    # ── RAG / LLM Explanation Section ────────────────────────────────────────
+    if rag_enabled and groq_api_key and RAG_AVAILABLE:
+        st.divider()
+        st.subheader("🧠 RAG-Based Threat Explanations — LLM Module")
+        st.caption("Retrieval-Augmented Generation using ChromaDB + Sentence Transformers + Groq LLaMA3")
+
+        with st.spinner("Loading knowledge base and generating explanations for top threats..."):
+            try:
+                # Load ChromaDB knowledge base
+                collection, embedder = get_knowledge_base()
+
+                # Get explanations for top high-risk entries
+                explanations = get_explanations_for_top_threats(
+                    result_df=result_df,
+                    original_df=df_raw,
+                    api_key=groq_api_key,
+                    collection=collection,
+                    embedder=embedder,
+                    max_explanations=5
+                )
+
+                if explanations:
+                    st.success(f"Generated explanations for {len(explanations)} high-risk log entries")
+
+                    for idx, exp_data in explanations.items():
+                        log_num    = exp_data['log_num']
+                        explanation = exp_data['explanation']
+                        validated  = exp_data['validated']
+
+                        # Show validation badge
+                        badge = "✅ Validated" if validated else "⚠️ Fallback"
+
+                        with st.expander(f"Log #{log_num} — {result_df.loc[idx, 'Prediction']} | {result_df.loc[idx, 'Risk Level']} Risk | {result_df.loc[idx, 'Attack Probability']} | {badge}"):
+
+                            # Show original label if available
+                            if 'Original Label' in result_df.columns:
+                                st.caption(f"Attack type: {result_df.loc[idx, 'Original Label']}")
+
+                            # Display explanation in sections
+                            lines = explanation.strip().split('\n')
+                            for line in lines:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                if line.startswith('THREAT SUMMARY:'):
+                                    st.error(f"🎯 {line}")
+                                elif line.startswith('ATTACK BEHAVIOR:'):
+                                    st.warning(f"⚡ {line}")
+                                elif line.startswith('RISK ASSESSMENT:'):
+                                    st.info(f"📊 {line}")
+                                elif line.startswith('RECOMMENDED ACTION:'):
+                                    st.success(f"🛡️ {line}")
+                                else:
+                                    st.write(line)
+
+                            # Hallucination mitigation note
+                            if validated:
+                                st.caption("🔒 Hallucination check passed — LLM output verified against model prediction")
+                            else:
+                                st.caption("⚠️ LLM output failed validation — showing fallback explanation")
+
+                else:
+                    st.info("No high-risk malicious entries found for explanation.")
+
+            except Exception as e:
+                st.error(f"RAG Error: {str(e)}")
+                st.info("Make sure your Groq API key is correct and you have internet connection.")
 
 else:
     st.info("👆 Upload a CSV log file from the sidebar to start live threat detection.")
